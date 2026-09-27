@@ -94,6 +94,7 @@ describe('it follows a write the user made', () => {
     expect(storage.persist).not.toHaveBeenCalled();
 
     game.ensureGameState('t1', GAMES[0].id);
+    await library.ensureGameRow(GAMES[0].id);
     game.toggleFavourite('t1');
     await vi.waitFor(() => expect(storage.persist).toHaveBeenCalledTimes(1));
   });

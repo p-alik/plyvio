@@ -23,13 +23,14 @@ vi.mock('$lib/data/games.js', () => ({
   // on the active library now asks `loadGames()` to reload for real, so
   // these need mocking too, the same as `tests/library-loadGames.test.js`
   // already does for `loadGames()` on its own.
-  readGames: vi.fn(async () => []),
-  readFavoriteIds: vi.fn(async () => []),
-  readTrashedIds: vi.fn(async () => []),
   readTags: vi.fn(async () => []),
   readCollections: vi.fn(async () => []),
-  readTagIdsByGame: vi.fn(async () => ({})),
-  readCollectionIdsByGame: vi.fn(async () => ({}))
+  readGameList: vi.fn(async () => []),
+  readGamesByIds: vi.fn(async () => []),
+  readGameMarks: vi.fn(async () => ({})),
+  countGameList: vi.fn(async () => 0),
+  readLibraryCounts: vi.fn(async () => ({ all: 0, favorites: 0, recent: 0, trash: 0, collection: {}, tag: {} })),
+  ensureGameSearch: vi.fn(async () => 0)
 }));
 
 const pasteDraft = (text) => ({ files: [], text, source: 'chesscom', username: '', range: 'all' });
@@ -95,15 +96,17 @@ describe('planImport — real Paste', () => {
   });
 });
 
-const { games, tags, collections } = await import('../src/lib/stores/library.js');
+const { games, tags, collections, ensureRange, visibleTotal } = await import('../src/lib/stores/library.js');
 const { startImport, resetImporter, phase, notice } = await import('../src/lib/stores/importer.js');
 const { libraryConnection } = await import('$lib/data/session.js');
 const { objects } = await import('../src/lib/stores/settings.js');
 const { activeLibraryId } = await import('../src/lib/stores/libraries.js');
 const {
-  insertGames, readGames, readFavoriteIds, readTrashedIds,
-  readTags, readCollections, readTagIdsByGame, readCollectionIdsByGame
+  insertGames, readGameList, readGamesByIds, readGameMarks, countGameList,
+  readLibraryCounts, ensureGameSearch, readTags, readCollections
 } = await import('$lib/data/games.js');
+
+const NO_COUNTS = { all: 0, favorites: 0, recent: 0, trash: 0, collection: {}, tag: {} };
 
 describe('the lane writes a real Paste import to the database', () => {
   beforeEach(() => {
@@ -113,9 +116,13 @@ describe('the lane writes a real Paste import to the database', () => {
     resetImporter();
     libraryConnection.mockReset();
     insertGames.mockReset();
-    for (const fn of [readGames, readFavoriteIds, readTrashedIds, readTags, readCollections, readTagIdsByGame, readCollectionIdsByGame]) {
+    const defaults = new Map([
+      [readGameList, []], [readGamesByIds, []], [readGameMarks, {}], [countGameList, 0],
+      [readLibraryCounts, NO_COUNTS], [ensureGameSearch, 0], [readTags, []], [readCollections, []]
+    ]);
+    for (const [fn, value] of defaults) {
       fn.mockReset();
-      fn.mockImplementation(async () => (fn === readTagIdsByGame || fn === readCollectionIdsByGame ? {} : []));
+      fn.mockImplementation(async () => value);
     }
     // `runRealWrite()` (via `connectionForLibrary()`) writes to the
     // request's own `destination` ('db-1', the shared `request()` helper's
@@ -172,15 +179,16 @@ describe('the lane writes a real Paste import to the database', () => {
     expect(libraryConnection).toHaveBeenCalledWith('db-1');
     expect(get(phase)).toBe('done');
     expect(get(games)).toEqual([]);
-    expect(readGames).not.toHaveBeenCalled();
+    expect(countGameList).not.toHaveBeenCalled();
+    expect(readGameList).not.toHaveBeenCalled();
     expect(get(notice).kind).toBe('clean');
   });
 
   it('reloads the Library view from the database when the destination IS the active library', async () => {
     // The other half of the same fix: when you're looking at the library you
     // just added to, the view must actually update -- through a real reload,
-    // not a hand-spliced copy of the inserted row. Setting up readGames() et
-    // al. to answer with the post-insert state (rather than asserting
+    // not a hand-spliced copy of the inserted row. Setting up readGameList()
+    // et al. to answer with the post-insert state (rather than asserting
     // against the row shape `insertGames()` returned) is what proves this
     // goes through `loadGames()` for real, not a shortcut that happens to
     // look similar.
@@ -191,15 +199,21 @@ describe('the lane writes a real Paste import to the database', () => {
       { id: 501, date: null, white: 'Carlsen, Magnus', whiteElo: 2830, black: 'Nepomniachtchi, Ian',
         blackElo: null, event: 'Test Open', result: '1-0', plyCount: null, createdAt: 'now' }
     ]);
-    readGames.mockResolvedValue([
+    readGameList.mockResolvedValue([
       { id: 501, date: null, white: 'Carlsen, Magnus', whiteElo: 2830, black: 'Nepomniachtchi, Ian',
         blackElo: null, event: 'Test Open', result: '1-0', plyCount: null, createdAt: 'now' }
     ]);
+    countGameList.mockResolvedValue(1);
 
     expect(startImport(request({ tags: [{ id: 5, name: 'Blitz' }], collections: [{ id: 9, name: 'Prep' }] }))).toBe(true);
     await flush();
 
-    expect(readGames).toHaveBeenCalledWith(connection, expect.objectContaining({ limit: expect.any(Number) }));
+    // The reload recounts the list; the table then asks for the rows its
+    // viewport shows, which is what `ensureRange` stands in for here.
+    expect(countGameList).toHaveBeenCalledWith(connection, expect.anything(), expect.anything());
+    expect(get(visibleTotal)).toBe(1);
+    await ensureRange(0, 0);
+    expect(readGameList).toHaveBeenCalledWith(connection, expect.anything(), expect.objectContaining({ limit: expect.any(Number), offset: 0 }));
     expect(get(games)).toHaveLength(1);
     expect(get(games)[0].white).toBe('Carlsen, Magnus');
     expect(get(games)[0].id).toBe(501);

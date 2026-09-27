@@ -24,7 +24,8 @@
   import AddGamesDialog from './AddGamesDialog.svelte';
   import ImportReport from './ImportReport.svelte';
   import {
-    visibleGames, games, selection, search, selectedGameId, selectGame,
+    visibleTotal, listTick, rowAt, ensureRange, indexOfGame, counts,
+    selection, search, selectedGameId, selectGame,
     selectSidebar, clearSearch, selectionLabel, toggleSidebar,
     subscriptions, collections, tags, offline, findGame
   } from '$lib/stores/library.js';
@@ -102,6 +103,9 @@
     }
   });
 
+  /** Where keyboard navigation is headed while the target row's page loads. */
+  let pendingIndex = null;
+
   function onKeydown(e) {
     const mod = e.metaKey || e.ctrlKey;
 
@@ -113,24 +117,35 @@
     if (e.key === 'Escape' && document.activeElement === searchEl) { doClear(); return; }
     if (mod) return;
 
-    const rows = $visibleGames;
-    if (!rows.length) return;
-    const i = rows.findIndex((g) => g.id === $selectedGameId);
+    const total = $visibleTotal;
+    if (!total) return;
+    // A key pressed while an earlier one's page is still arriving moves on
+    // from where that one is going, not from where the selection still is —
+    // otherwise holding PageDown stalls at every page boundary.
+    const i = pendingIndex ?? indexOfGame($selectedGameId);
 
-    const go = (n) => {
-      const clamped = Math.max(0, Math.min(rows.length - 1, n));
-      selectGame(rows[clamped].id);
-      tableRef?.scrollTo(clamped);
+    /* The target row may be on a page not fetched yet — End on a library of
+       thousands, say — so it is fetched first, then selected. */
+    const go = async (n) => {
       e.preventDefault();
+      const clamped = Math.max(0, Math.min(total - 1, n));
+      pendingIndex = clamped;
+      await ensureRange(clamped, clamped);
+      if (pendingIndex !== clamped) return;   // a later key superseded this one
+      pendingIndex = null;
+      const g = rowAt(clamped);
+      if (!g) return;
+      selectGame(g.id);
+      tableRef?.scrollTo(clamped);
     };
 
     if (e.key === 'ArrowDown') go(i < 0 ? 0 : i + 1);
     else if (e.key === 'ArrowUp') go(i < 0 ? 0 : i - 1);
     else if (e.key === 'Home') go(0);
-    else if (e.key === 'End') go(rows.length - 1);
+    else if (e.key === 'End') go(total - 1);
     else if (e.key === 'PageDown') go((i < 0 ? 0 : i) + 20);
     else if (e.key === 'PageUp') go((i < 0 ? 0 : i) - 20);
-    else if (e.key === 'Enter' && i >= 0) { e.preventDefault(); open(rows[i].id); }
+    else if (e.key === 'Enter' && i >= 0) { e.preventDefault(); open($selectedGameId); }
   }
 
   const n = (v) => v.toLocaleString($locale);
@@ -139,16 +154,16 @@
      filter and the field already shows the term; restating them here makes the
      status bar unscannable. */
   const status = $derived(
-    $visibleGames.length === 1
+    $visibleTotal === 1
       ? $t('lib.oneGame')
-      : $t('lib.games', { n: n($visibleGames.length) })
+      : $t('lib.games', { n: n($visibleTotal) })
   );
 
   const emptyKind = $derived(
-    $visibleGames.length > 0 ? null
+    $visibleTotal > 0 ? null
       : $search.trim() ? 'search'
       : $selection.kind === 'trash' ? 'trash'
-      : $games.filter((g) => !g.trashed).length === 0 ? 'library'
+      : $counts.all === 0 ? 'library'
       : 'filter'
   );
 </script>
@@ -214,7 +229,10 @@
     {:else}
       <ContentTable
         bind:this={tableRef}
-        rows={$visibleGames}
+        total={$visibleTotal}
+        version={$listTick}
+        {rowAt}
+        {ensureRange}
         selectedId={$selectedGameId}
         onselect={selectGame}
         onopen={open}

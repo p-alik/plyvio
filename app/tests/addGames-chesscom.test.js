@@ -22,13 +22,14 @@ vi.mock('$lib/data/session.js', () => ({
 }));
 vi.mock('$lib/data/games.js', () => ({
   insertGames: vi.fn(),
-  readGames: vi.fn(async () => []),
-  readFavoriteIds: vi.fn(async () => []),
-  readTrashedIds: vi.fn(async () => []),
   readTags: vi.fn(async () => []),
   readCollections: vi.fn(async () => []),
-  readTagIdsByGame: vi.fn(async () => ({})),
-  readCollectionIdsByGame: vi.fn(async () => ({})),
+  readGameList: vi.fn(async () => []),
+  readGamesByIds: vi.fn(async () => []),
+  readGameMarks: vi.fn(async () => ({})),
+  countGameList: vi.fn(async () => 0),
+  readLibraryCounts: vi.fn(async () => ({ all: 0, favorites: 0, recent: 0, trash: 0, collection: {}, tag: {} })),
+  ensureGameSearch: vi.fn(async () => 0),
   // Stage 2 (incremental re-import) defaults every test to "first import,
   // nothing known yet" unless a test overrides them -- its own describe
   // block below does.
@@ -85,7 +86,7 @@ const { startImport, resetImporter, cancelImport, retryImport, phase, downloaded
 const { libraryConnection } = await import('$lib/data/session.js');
 const { objects } = await import('../src/lib/stores/settings.js');
 const { activeLibraryId } = await import('../src/lib/stores/libraries.js');
-const { insertGames, readGames, latestGameDateForSource, gamePgnsForSourceOnDate } = await import('$lib/data/games.js');
+const { insertGames, readGameList, latestGameDateForSource, gamePgnsForSourceOnDate } = await import('$lib/data/games.js');
 const { fetchAllGames, ChessComUserNotFoundError, endTimeFromPgn } = await import('$lib/import/sources/chesscom.js');
 
 describe('the lane runs a real Chess.com import', () => {
@@ -96,8 +97,8 @@ describe('the lane runs a real Chess.com import', () => {
     resetImporter();
     libraryConnection.mockReset();
     insertGames.mockReset();
-    readGames.mockReset();
-    readGames.mockImplementation(async () => []);
+    readGameList.mockReset();
+    readGameList.mockImplementation(async () => []);
     latestGameDateForSource.mockReset();
     latestGameDateForSource.mockImplementation(async () => null);
     gamePgnsForSourceOnDate.mockReset();
@@ -245,8 +246,8 @@ describe('stage 2 -- incremental re-import (EXPLORATION.md, "Per-game source tra
     libraryConnection.mockReset();
     libraryConnection.mockResolvedValue({});
     insertGames.mockReset();
-    readGames.mockReset();
-    readGames.mockImplementation(async () => []);
+    readGameList.mockReset();
+    readGameList.mockImplementation(async () => []);
     fetchAllGames.mockReset();
     latestGameDateForSource.mockReset();
     gamePgnsForSourceOnDate.mockReset();

@@ -6,6 +6,13 @@
    * Rows are virtualised: a library of thousands cannot put every row in the
    * DOM, so `aria-rowcount` states the true total while only a window exists.
    *
+   * The data is virtualised too. The table gets a `total` and a `rowAt(i)`
+   * rather than an array, and asks `ensureRange(first, last)` for whatever its
+   * window shows; a row whose page has not arrived yet draws as an empty,
+   * busy row of the same height, so the scroll geometry never shifts.
+   * `version` changes whenever the list or a fetched page does — the only signal
+   * the table has that `rowAt` would now answer differently.
+   *
    * Column widths come from $lib/library/columns.js, which is pure so the
    * model is testable — vitest applies no stylesheets, so measured widths
    * could not be verified any other way.
@@ -14,7 +21,7 @@
   import { t } from '$lib/stores/i18n.js';
   import { layoutColumns, TABLE_MIN, cellValue } from '$lib/library/columns.js';
 
-  let { rows = [], selectedId = null, onselect, onopen } = $props();
+  let { total = 0, version = 0, rowAt, ensureRange, selectedId = null, onselect, onopen } = $props();
 
   const ROW_H = 30;
   const OVERSCAN = 8;
@@ -29,7 +36,18 @@
 
   const first = $derived(Math.max(0, Math.floor(scrollTop / ROW_H) - OVERSCAN));
   const visibleCount = $derived(Math.ceil((height || 400) / ROW_H) + OVERSCAN * 2);
-  const slice = $derived(rows.slice(first, first + visibleCount));
+  const last = $derived(Math.min(total, first + visibleCount));
+  const slice = $derived.by(() => {
+    version;
+    const out = [];
+    for (let i = first; i < last; i++) out.push({ i, g: rowAt(i) });
+    return out;
+  });
+
+  $effect(() => {
+    version;
+    if (last > first) ensureRange?.(first, last - 1);
+  });
 
   function onScroll() {
     if (viewport) scrollTop = viewport.scrollTop;
@@ -80,18 +98,19 @@
     bind:this={viewport}
     onscroll={onScroll}
     role="grid"
-    aria-rowcount={rows.length}
+    aria-rowcount={total}
     aria-label={$t('lib.allGames')}
     tabindex="-1"
   >
-    <div class="spacer" style="height:{rows.length * ROW_H}px; width:{tableWidth}px">
+    <div class="spacer" style="height:{total * ROW_H}px; width:{tableWidth}px">
       <div class="rows" style="transform:translateY({first * ROW_H}px)">
-        {#each slice as g, i (g.id)}
+        {#each slice as { i, g } (i)}
+          {#if g}
           <div
             class="row"
             class:sel={g.id === selectedId}
             role="row"
-            aria-rowindex={first + i + 1}
+            aria-rowindex={i + 1}
             aria-selected={g.id === selectedId}
             tabindex={g.id === selectedId ? 0 : -1}
             data-game-id={g.id}
@@ -103,6 +122,13 @@
               <div class="cell" class:m={c.mono} role="gridcell" style="width:{c.w}px">{cellValue(g, c)}</div>
             {/each}
           </div>
+          {:else}
+          <div class="row" role="row" aria-rowindex={i + 1} aria-busy="true">
+            {#each cols as c (c.key)}
+              <div class="cell" role="gridcell" style="width:{c.w}px"></div>
+            {/each}
+          </div>
+          {/if}
         {/each}
       </div>
     </div>

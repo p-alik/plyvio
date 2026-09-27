@@ -8,6 +8,7 @@
  */
 
 import { DataError } from './connection.js';
+import { fold, searchText } from '../library/fold.js';
 
 /** The eight columns of §3.2.4.2, in the order the table draws them. */
 export const LIST_COLUMNS = [
@@ -118,19 +119,230 @@ export const readGames = async (connection, { limit = 200, offset = 0, order = '
     `select ${ROW_COLUMNS.join(', ')} from games order by ${by[order] ?? by.date} limit ? offset ?`,
     [limit, offset]
   );
-  return rows.map((row) => ({
-    id: row.id,
-    date: row.date,
-    white: row.white,
-    whiteElo: row.white_elo,
-    black: row.black,
-    blackElo: row.black_elo,
-    event: row.event,
-    result: row.result,
-    plyCount: row.ply_count,
-    createdAt: row.created_at
-  }));
+  return rows.map(toRow);
 };
+
+/** One `games` row, as the Content Table's camelCase row shape. */
+const toRow = (row) => ({
+  id: row.id,
+  date: row.date,
+  white: row.white,
+  whiteElo: row.white_elo,
+  black: row.black,
+  blackElo: row.black_elo,
+  event: row.event,
+  result: row.result,
+  plyCount: row.ply_count,
+  createdAt: row.created_at
+});
+
+/* ---------------- the Content Table's list, paged ------------------ */
+
+const NOT_TRASHED = 'id not in (select game_id from trash)';
+
+/**
+ * The `where` clause for one Content Table query — a Sidebar selection, then
+ * a search term within it (§3.2.4.1, §3.2.4.3). Must answer exactly what
+ * `stores/library.js`'s `applySelection` + `applySearch` answer over an
+ * in-memory array; `tests/data-gameList.test.js` holds the two side by side.
+ *
+ * `searchReady` says whether `game_search` is complete for this database (see
+ * `ensureGameSearch`). Until it is, search falls back to `LIKE` over the raw
+ * columns — ASCII-case-insensitive only, so "polgar" misses "Polgár" for that
+ * moment, but it never returns nothing merely because the backfill has not
+ * finished.
+ *
+ * @param {{ selection?: { kind: string, id?: number }, search?: string }} query
+ * @param {{ searchReady?: boolean }} [options]
+ * @returns {{ sql: string, params: unknown[] }}
+ */
+export const gameListWhere = ({ selection = { kind: 'all' }, search = '' } = {}, { searchReady = true } = {}) => {
+  const clauses = [];
+  const params = [];
+
+  switch (selection.kind) {
+    case 'trash':
+      clauses.push('id in (select game_id from trash)');
+      break;
+    case 'favorites':
+      clauses.push(NOT_TRASHED, 'id in (select game_id from favorites)');
+      break;
+    case 'recent':
+      // §4.3.2: the last import — every live game sharing the latest
+      // non-empty created_at among live games. Same rule as `recentlyAdded()`.
+      clauses.push(
+        NOT_TRASHED,
+        "created_at = (select max(created_at) from games where created_at is not null and created_at <> '' and " +
+          `${NOT_TRASHED})`
+      );
+      break;
+    case 'subscription':
+      clauses.push(NOT_TRASHED, 'id in (select game_id from subscription_games where subscription_id = ?)');
+      params.push(selection.id);
+      break;
+    case 'collection':
+      clauses.push(NOT_TRASHED, 'id in (select game_id from collection_games where collection_id = ?)');
+      params.push(selection.id);
+      break;
+    case 'tag':
+      clauses.push(NOT_TRASHED, 'id in (select game_id from tag_games where tag_id = ?)');
+      params.push(selection.id);
+      break;
+    case 'all':
+    default:
+      clauses.push(NOT_TRASHED);
+  }
+
+  const term = fold(search.trim());
+  if (term) {
+    const pattern = `%${term.replace(/[\\%_]/g, (c) => `\\${c}`)}%`;
+    if (searchReady) {
+      clauses.push("id in (select game_id from game_search where text like ? escape '\\')");
+      params.push(pattern);
+    } else {
+      const cols = ['white', 'black', 'event', 'date', 'result'];
+      clauses.push(`(${cols.map((c) => `coalesce(${c}, '') like ? escape '\\'`).join(' or ')})`);
+      params.push(...cols.map(() => pattern));
+    }
+  }
+
+  return { sql: clauses.join(' and '), params };
+};
+
+/**
+ * A database not built by this application may lack `subscription_games`
+ * (§7's own caveat). A subscription selection against one is empty, not an
+ * error — the same degradation `countNewGamesForSubscription` uses.
+ */
+const orEmptyForSubscription = async (query, read, empty) => {
+  try {
+    return await read();
+  } catch (error) {
+    if (query.selection?.kind === 'subscription') return empty;
+    throw error;
+  }
+};
+
+/**
+ * One page of the Content Table's rows for `query`, in the table's order
+ * (`date desc, id` — `readGames`'s own default).
+ */
+export const readGameList = async (connection, query, { limit = 200, offset = 0, searchReady = true } = {}) => {
+  const { sql, params } = gameListWhere(query, { searchReady });
+  return orEmptyForSubscription(query, async () =>
+    (await connection.all(
+      `select ${ROW_COLUMNS.join(', ')} from games where ${sql} order by date desc, id limit ? offset ?`,
+      [...params, limit, offset]
+    )).map(toRow), []);
+};
+
+/**
+ * Specific games by id, in the Content Table's row shape. An id no longer in
+ * the database is simply absent from the result. The caller bounds `ids` —
+ * each is one SQL variable.
+ */
+export const readGamesByIds = async (connection, ids) => {
+  if (!ids.length) return [];
+  return (await connection.all(
+    `select ${ROW_COLUMNS.join(', ')} from games where id in (${ids.map(() => '?').join(', ')})`,
+    ids
+  )).map(toRow);
+};
+
+/** How many rows `readGameList` would return for `query`, across every page. */
+export const countGameList = async (connection, query, { searchReady = true } = {}) => {
+  const { sql, params } = gameListWhere(query, { searchReady });
+  return orEmptyForSubscription(query, async () =>
+    Number(await connection.value(`select count(*) from games where ${sql}`, params)) || 0, 0);
+};
+
+/**
+ * The per-user marks for just these games — one page's worth — rather than
+ * every mark in the database. Keyed by game id.
+ *
+ * @returns {Promise<Record<number, { favorite: boolean, trashed: boolean, tags: number[], collections: number[] }>>}
+ */
+export const readGameMarks = async (connection, ids) => {
+  const marks = Object.fromEntries(ids.map((id) => [id, { favorite: false, trashed: false, tags: [], collections: [] }]));
+  if (!ids.length) return marks;
+  const inList = `(${ids.map(() => '?').join(', ')})`;
+  const [fav, trash, tagRows, collRows] = await Promise.all([
+    connection.all(`select game_id from favorites where game_id in ${inList}`, ids),
+    connection.all(`select game_id from trash where game_id in ${inList}`, ids),
+    connection.all(`select game_id, tag_id from tag_games where game_id in ${inList}`, ids),
+    connection.all(`select game_id, collection_id from collection_games where game_id in ${inList}`, ids)
+  ]);
+  for (const r of fav) marks[r.game_id].favorite = true;
+  for (const r of trash) marks[r.game_id].trashed = true;
+  for (const r of tagRows) marks[r.game_id].tags.push(r.tag_id);
+  for (const r of collRows) marks[r.game_id].collections.push(r.collection_id);
+  return marks;
+};
+
+/**
+ * The Sidebar's trailing counts (§3.2.3), each one the size of the list its
+ * row selects. Tag and Collection counts exclude trashed games here, unlike
+ * `readTagCounts`/`readCollectionCounts`, because the Sidebar's row count must
+ * match what selecting that row shows.
+ */
+export const readLibraryCounts = async (connection) => {
+  const count = async (selection) => countGameList(connection, { selection });
+  const grouped = async (table, key) => {
+    const rows = await connection.all(
+      `select ${key} as k, count(*) as n from ${table} where game_id not in (select game_id from trash) group by ${key}`
+    );
+    return Object.fromEntries(rows.map((r) => [r.k, r.n]));
+  };
+  const [all, favorites, recent, trash, collection, tag] = await Promise.all([
+    count({ kind: 'all' }),
+    count({ kind: 'favorites' }),
+    count({ kind: 'recent' }),
+    count({ kind: 'trash' }),
+    grouped('collection_games', 'collection_id'),
+    grouped('tag_games', 'tag_id')
+  ]);
+  return { all, favorites, recent, trash, collection, tag };
+};
+
+/* ---------------- game_search: derived search text ------------------ */
+
+const GAME_SEARCH_DDL =
+  'create table if not exists game_search (' +
+  'game_id integer primary key references games(id) on delete cascade, text text not null)';
+
+const SEARCH_CHUNK = 500;
+
+/**
+ * Make `game_search` complete for this database: create it if missing, then
+ * add a row for every game without one. Derived data, reconstructible from
+ * `games` (database-schema.md §6a) — it never writes to `games` itself, so a
+ * library supplied by another application is not "imported" by opening it.
+ *
+ * Chunked, one single-statement insert per chunk, for the same pooling reason
+ * `insertGames` gives.
+ *
+ * @returns {Promise<number>} how many rows were added.
+ */
+export const ensureGameSearch = async (connection) => {
+  await connection.run(GAME_SEARCH_DDL);
+  let added = 0;
+  for (;;) {
+    const missing = await connection.all(
+      'select id, white, black, event, date, result from games ' +
+        'where id not in (select game_id from game_search) limit ?',
+      [SEARCH_CHUNK]
+    );
+    if (!missing.length) return added;
+    await insertSearchRows(connection, missing);
+    added += missing.length;
+  }
+};
+
+const insertSearchRows = (connection, rows) =>
+  connection.run(
+    `insert or replace into game_search (game_id, text) values ${rows.map(() => '(?, ?)').join(', ')}`,
+    rows.flatMap((g) => [g.id, searchText(g)])
+  );
 
 /**
  * The columns `insertGame` can supply, in the order database-schema.md's §1
@@ -271,6 +483,11 @@ export const insertGames = async (connection, rows) => {
   const placeholders = `(${columns.map(() => '?').join(', ')})`;
   const rowsPerBatch = Math.max(1, Math.floor(MAX_INSERT_VARIABLES / columns.length));
 
+  // game_search (§6a) is derived from exactly what this writes, so it is
+  // written alongside rather than left for `ensureGameSearch` to backfill.
+  // `if not exists` because a library from another application may lack it.
+  await connection.run(GAME_SEARCH_DDL);
+
   const inserted = [];
   for (let start = 0; start < rows.length; start += rowsPerBatch) {
     const batch = rows.slice(start, start + rowsPerBatch);
@@ -296,6 +513,7 @@ export const insertGames = async (connection, rows) => {
         createdAt: fields.created_at ?? null
       });
     });
+    await insertSearchRows(connection, inserted.slice(-batch.length));
   }
 
   return inserted;

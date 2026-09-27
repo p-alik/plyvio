@@ -693,6 +693,52 @@ describe('§3.2.4.3 selection and opening', () => {
     expect(get(stripTabs).filter((t) => t.kind === 'game').length).toBe(2);
   });
 
+  /* Keyboard navigation goes through the paged list's own API (`rowAt`,
+     `ensureRange`, `indexOfGame`) in either mode, and each move is async —
+     the target row may be on a page not fetched yet. */
+  const press = async (key) => {
+    await fireEvent.keyDown(window, { key });
+    await new Promise((r) => setTimeout(r, 0));
+    await tick();
+  };
+
+  it('arrow keys, Home, End and PageDown move the selection through the whole list', async () => {
+    render(AppShell);
+    await tick();
+    const rows = get(visibleGames);
+
+    await press('ArrowDown');
+    expect(get(selectedGameId)).toBe(rows[0].id);
+    await press('ArrowDown');
+    expect(get(selectedGameId)).toBe(rows[1].id);
+    await press('End');
+    expect(get(selectedGameId)).toBe(rows[rows.length - 1].id);
+    await press('Home');
+    expect(get(selectedGameId)).toBe(rows[0].id);
+    await press('PageDown');
+    expect(get(selectedGameId)).toBe(rows[20].id);
+    await press('ArrowUp');
+    expect(get(selectedGameId)).toBe(rows[19].id);
+  });
+
+  it('keys pressed in quick succession each count, rather than aiming at the same row', async () => {
+    render(AppShell);
+    await tick();
+    const rows = get(visibleGames);
+    await press('Home');
+    for (let i = 0; i < 3; i++) fireEvent.keyDown(window, { key: 'PageDown' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get(selectedGameId)).toBe(rows[60].id);
+  });
+
+  it('Enter opens the selected game', async () => {
+    render(AppShell);
+    await tick();
+    await press('ArrowDown');
+    await press('Enter');
+    expect(get(stripTabs).filter((t) => t.kind === 'game').length).toBe(1);
+  });
+
   it('opening a game leaves the Library filter, search and selection alone', async () => {
     const { container } = render(AppShell);
     selectSidebar({ kind: 'favorites' });

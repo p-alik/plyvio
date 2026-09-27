@@ -2,9 +2,10 @@ import { writable, derived, get } from 'svelte/store';
 import { browser } from '$app/environment';
 import { SUBSCRIPTIONS } from '$lib/library/mock.js';
 import {
-  readGames, readFavoriteIds, readTrashedIds, readTags, readCollections,
-  readTagIdsByGame, readCollectionIdsByGame
+  readTags, readCollections, readGameList, countGameList, readGameMarks,
+  readGamesByIds, readLibraryCounts, ensureGameSearch
 } from '$lib/data/games.js';
+import { fold } from '$lib/library/fold.js';
 import { libraryConnection } from '$lib/data/session.js';
 import { objects } from './settings.js';
 import { activeLibraryId } from './libraries.js';
@@ -19,17 +20,17 @@ import { activeLibraryId } from './libraries.js';
  */
 
 /**
- * The Content Table's rows.
+ * Library rows, by what the list's `mode` (below) makes them.
  *
- * Starts empty and is filled by `loadGames()` — see there for why this is a
- * single generous fetch rather than true incremental paging. Every per-user
- * mark (`trashed`, `favorite`, `tags`, `collections`) is filled by
- * `loadGames()`, from its own tables — `subscription` is the one field
- * still unfilled (see there). `createdAt` comes straight off the real
- * `games.created_at` column and is what `recentlyAdded()` (below) uses.
+ * In 'memory' mode, every row of the list — the mock/sandbox library, and
+ * tests, which set it directly (`games.set(makeGames())`). In 'sql' mode, a
+ * cache of the rows fetched so far from the real database, in no particular
+ * order — the list's order lives in its pages (`rowAt()`), not here.
  *
- * Tests set this directly (`games.set(makeGames())`) and are unaffected by
- * `loadGames()`, which they never call.
+ * Every per-user mark (`trashed`, `favorite`, `tags`, `collections`) is
+ * filled alongside the row, from its own tables — `subscription` is the one
+ * field still unfilled (see `withMarks`). `createdAt` comes straight off the
+ * real `games.created_at` column and is what `recentlyAdded()` (below) uses.
  */
 export const games = writable([]);
 export const subscriptions = writable(SUBSCRIPTIONS);
@@ -70,6 +71,195 @@ export async function activeLibraryConnection() {
   return connectionForLibrary(get(activeLibraryId));
 }
 
+/* ---------------- the Content Table's list, paged -------------------- */
+
+/**
+ * Rows fetched per request. `readGames`'s own default page, and about seven
+ * screens of the table at 30px a row.
+ */
+export const PAGE = 200;
+
+/**
+ * Where the Content Table's rows come from.
+ *
+ * 'memory' — `games` IS the list: every row is in it, and filtering, search
+ *   and counts run over it in JavaScript (`applySelection`, `applySearch`,
+ *   `memoryCounts`). The mock/sandbox library and the test suite use this;
+ *   `tests/library.test.js` drives it directly with `games.set(...)`.
+ *
+ * 'sql' — a real game database is open. The list is paged: `ensureRange()`
+ *   fetches pages of `PAGE` rows as the table's viewport needs them, filtered,
+ *   searched and ordered by the database (`data/games.js`'s `gameListWhere`),
+ *   so a library of any size costs one screen of rows, not all of them. The
+ *   5,000-row single load this replaced silently truncated a larger library.
+ *   `games` becomes a by-id cache of every row fetched so far — what
+ *   `findGame()` and a Game tab's Info card (`stores/game.js`) read, and what
+ *   their optimistic favourite/tag/collection edits write into.
+ */
+let mode = 'memory';
+/** The connection the 'sql' list reads through; null in 'memory' mode. */
+let listConnection = null;
+/**
+ * Whether `game_search` is complete for `listConnection` — see
+ * `data/games.js`'s `ensureGameSearch`. Until it is, search runs on the raw
+ * columns instead.
+ */
+let searchReady = false;
+/** The library `loadGames()` last loaded, to tell a switch from a reload. */
+let loadedLibraryId;
+
+/** Page index -> the ids on that page, or the in-flight fetch of it. */
+let pages = new Map();
+/** Bumped whenever the list is invalidated; a page fetched under an older one is discarded. */
+let listVersion = 0;
+/** Bumped whenever the list changes OR a page lands — what the Content Table re-renders on. */
+export const listTick = writable(0);
+/** How many rows the current selection + search yields, across every page. */
+export const visibleTotal = writable(0);
+
+const EMPTY_COUNTS = { all: 0, favorites: 0, recent: 0, trash: 0, collection: {}, tag: {} };
+/** Counts for the Sidebar trailing slots. */
+export const counts = writable(EMPTY_COUNTS);
+
+let rowsById = new Map();
+games.subscribe((all) => { rowsById = new Map(all.map((g) => [g.id, g])); });
+
+/** Put rows into the `games` cache, replacing any with the same id. */
+function upsertRows(rows) {
+  if (!rows.length) return;
+  games.update((all) => {
+    const byId = new Map(all.map((g) => [g.id, g]));
+    for (const r of rows) byId.set(r.id, r);
+    return [...byId.values()];
+  });
+}
+
+/** A `games` row as the Content Table reads it, marks included. */
+const withMarks = (row, marks) => ({
+  ...row,
+  ...(marks ?? { favorite: false, trashed: false, tags: [], collections: [] }),
+  // subscription_games (§8) records which subscription a game arrived
+  // through, in this same database — read path not added yet.
+  subscription: null
+  // games.created_at (§1) may legitimately be NULL — `recentlyAdded()`
+  // already treats a falsy `createdAt` as ineligible.
+});
+
+const listQuery = () => ({ selection: get(selection), search: get(search) });
+
+let refreshSequence = 0;
+
+/**
+ * Invalidate the list: drop every fetched page, recount the current
+ * selection + search, and — `recount` — the Sidebar's counts too. The rows
+ * already in `games` stay; only which ids sit at which index is forgotten.
+ *
+ * Runs on every selection or search change (`recount: false` — neither
+ * changes a Sidebar count), from `loadGames()`, and after a write that can
+ * move a game between lists (`stores/game.js`'s `persistFavourite`).
+ */
+export async function refreshList({ recount = true } = {}) {
+  const sequence = ++refreshSequence;
+  listVersion++;
+  pages = new Map();
+  listTick.update((n) => n + 1);
+
+  if (mode === 'memory') {
+    visibleTotal.set(get(visibleGames).length);
+    if (recount) counts.set(memoryCounts(get(games)));
+    return;
+  }
+
+  const connection = listConnection;
+  try {
+    const [total, fresh] = await Promise.all([
+      countGameList(connection, listQuery(), { searchReady }),
+      recount ? readLibraryCounts(connection) : null
+    ]);
+    if (sequence !== refreshSequence) return;
+    visibleTotal.set(total);
+    if (fresh) counts.set(fresh);
+  } catch (err) {
+    console.error('Plyvio: failed to count the library list', err);
+  }
+}
+
+/**
+ * Make sure rows `first`..`last` (inclusive, list indices) are fetched. The
+ * Content Table calls this for its viewport; keyboard navigation calls it
+ * before selecting a row it may not have yet. A page already fetched, or
+ * already being fetched, is not fetched again. Nothing to do in 'memory'
+ * mode, where every row already is.
+ */
+export function ensureRange(first, last) {
+  if (mode !== 'sql' || last < first) return Promise.resolve();
+  const jobs = [];
+  for (let p = Math.floor(first / PAGE); p <= Math.floor(last / PAGE); p++) {
+    if (!pages.has(p)) pages.set(p, fetchPage(p, listVersion));
+    jobs.push(pages.get(p));
+  }
+  return Promise.all(jobs);
+}
+
+async function fetchPage(p, version) {
+  const connection = listConnection;
+  const current = pages;
+  try {
+    const rows = await readGameList(connection, listQuery(), { limit: PAGE, offset: p * PAGE, searchReady });
+    const marks = await readGameMarks(connection, rows.map((r) => r.id));
+    // The list moved on while this was in flight — a different selection,
+    // search or library. Its rows answer a question nobody is asking.
+    if (version !== listVersion) return;
+    upsertRows(rows.map((r) => withMarks(r, marks[r.id])));
+    current.set(p, rows.map((r) => r.id));
+    listTick.update((n) => n + 1);
+  } catch (err) {
+    // Forget the attempt, so the next scroll past this page retries it.
+    if (current.get(p) instanceof Promise) current.delete(p);
+    console.error(`Plyvio: failed to read library page ${p}`, err);
+  }
+}
+
+let visibleNow = [];
+
+/** The row at list index `i`, or null while its page has not arrived. */
+export function rowAt(i) {
+  if (mode === 'memory') return visibleNow[i] ?? null;
+  const ids = pages.get(Math.floor(i / PAGE));
+  if (!Array.isArray(ids)) return null;
+  const id = ids[i % PAGE];
+  return id === undefined ? null : rowsById.get(id) ?? null;
+}
+
+/**
+ * Make sure game `id`'s row is in the `games` cache, fetching it alone if it
+ * is not. A Game tab's Info card reads its marks from that row
+ * (`stores/game.js`), and in 'sql' mode a game can be open without its row
+ * on any fetched page — after the list moved on, or a switch away and back.
+ */
+export async function ensureGameRow(id) {
+  if (mode !== 'sql' || rowsById.has(id)) return;
+  const connection = listConnection;
+  try {
+    const [row] = await rereadRows(connection, [id]);
+    if (row && listConnection === connection && !rowsById.has(id)) upsertRows([row]);
+  } catch (err) {
+    console.error(`Plyvio: failed to read library row ${id}`, err);
+  }
+}
+
+/** The list index of game `id`, or -1 when it is not in a fetched page. */
+export function indexOfGame(id) {
+  if (id == null) return -1;
+  if (mode === 'memory') return visibleNow.findIndex((g) => g.id === id);
+  for (const [p, ids] of pages) {
+    if (!Array.isArray(ids)) continue;
+    const at = ids.indexOf(id);
+    if (at >= 0) return p * PAGE + at;
+  }
+  return -1;
+}
+
 /**
  * `loadGames()`'s own call sequence — bumped at the start of every call, so
  * a call can tell whether it is still the most recent one once its awaits
@@ -81,24 +271,44 @@ export async function activeLibraryConnection() {
  */
 let loadGamesSequence = 0;
 
+/** How many ids one `readGamesByIds`/`readGameMarks` round trip carries. */
+const REFRESH_CHUNK = 500;
+
+/** Re-read rows already in the `games` cache, marks included; ids gone from the database drop out. */
+async function rereadRows(connection, ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += REFRESH_CHUNK) {
+    const chunk = ids.slice(i, i + REFRESH_CHUNK);
+    const [rows, marks] = await Promise.all([
+      readGamesByIds(connection, chunk),
+      readGameMarks(connection, chunk)
+    ]);
+    out.push(...rows.map((r) => withMarks(r, marks[r.id])));
+  }
+  return out;
+}
+
 /**
- * Replace `games` with rows read from the active library's game database,
- * through the seam in `$lib/data`.
+ * Point the Content Table at the active library's game database, through
+ * the seam in `$lib/data`.
  *
- * A generous single page, not true incremental fetching: `readGames` is
- * already query-shaped for `limit`/`offset`, but `ContentTable.svelte`
- * still virtualises DOM rows over an already-loaded array — it does not yet
- * fetch on scroll. Swapping that is a separate change; this one proves the
- * read path without it, which is why `limit` defaults well above the
- * sample database's size rather than to `readGames`'s own default page.
+ * Reads no page of rows itself: it picks the list's mode (see `mode`),
+ * reloads `tags`, `collections` and the Sidebar `counts`, and invalidates the
+ * list (`refreshList()`), after which the table's own `ensureRange()` calls
+ * fetch whatever its viewport shows.
+ *
+ * A SWITCH to another library empties the `games` cache — its ids mean
+ * nothing in the new database. A RELOAD of the same library re-reads the
+ * rows already cached instead, so a Game tab's row (`stores/game.js`'s Info
+ * card) picks up what the write changed — a newly created tag's real id in
+ * place of its synthetic one, say — rather than vanishing.
  *
  * Runs on mount and again every time `activeLibraryId` changes (see the
  * subscribe below), and again whenever a write lands on a Library-view field
  * of the active library (`stores/importer.js`'s `runRealWrite` — a real
- * import's rows; a future favorite/trash/tag/collection write follows the
- * same rule). It deliberately does NOT run for a write that touches only
- * fields this query never reads — movetext, comments, engine data — since
- * `readGames()` below has nothing to show differently for those.
+ * import's rows; `stores/game.js`'s `persistGameInfo` — tags, collections,
+ * favourite). It deliberately does NOT run for a write that touches only
+ * fields the list never reads — movetext, comments, engine data.
  *
  * STALE RESULTS ARE DISCARDED, NOT APPLIED. Two callers can legitimately
  * overlap — a switch's reload still in flight when an import's reload
@@ -109,11 +319,12 @@ let loadGamesSequence = 0;
  * its result if nothing newer has started in the meantime. When
  * `activeLibraryConnection()` resolves `null` (no library selected, no real
  * backend available, or a still-mock row with nothing to open), `games` is
- * explicitly reset rather than left stale — see the PWA stopgap below,
- * which is the one exception with something real to show.
+ * explicitly reset rather than left stale.
  */
-export async function loadGames({ limit = 5000 } = {}) {
+export async function loadGames() {
   const sequence = ++loadGamesSequence;
+  const libraryId = get(activeLibraryId);
+  const switched = libraryId !== loadedLibraryId;
 
   const connection = await activeLibraryConnection();
   if (!connection) {
@@ -121,55 +332,57 @@ export async function loadGames({ limit = 5000 } = {}) {
     // No real database behind the active library — Master Games in the PWA
     // (deliberately never given one; see `stores/settings.js`'s
     // `ensureSampleGamesLibrary()`), nothing selected yet, or a genuine
-    // connection failure. Sample Games no longer reaches this branch on the
-    // PWA: `ensureSampleGamesLibrary()` registers it as a real library on
-    // first launch, so `activeLibraryConnection()` resolves a real
-    // connection for it the same way it always has for every Tauri
-    // library, and the read path below runs.
+    // connection failure.
+    mode = 'memory';
+    listConnection = null;
+    loadedLibraryId = libraryId;
     games.set([]);
     tags.set([]);
     collections.set([]);
+    refreshList();
     return;
   }
 
-  const [rows, favoriteIds, trashedIds, tagRows, collectionRows, tagsByGame, collectionsByGame] =
-    await Promise.all([
-      readGames(connection, { limit }),
-      readFavoriteIds(connection),
-      readTrashedIds(connection),
-      readTags(connection),
-      readCollections(connection),
-      readTagIdsByGame(connection),
-      readCollectionIdsByGame(connection)
-    ]);
+  const known = switched ? [] : get(games).map((g) => g.id);
+  const [tagRows, collectionRows, reread] = await Promise.all([
+    readTags(connection),
+    readCollections(connection),
+    rereadRows(connection, known)
+  ]);
 
   // A newer call has started since this one began — its result, once it
   // lands, is the authoritative one. Applying this older result now would
   // silently undo whatever the newer call already found or is about to.
   if (sequence !== loadGamesSequence) return;
 
-  const favorite = new Set(favoriteIds);
-  const trashed = new Set(trashedIds);
-
-  games.set(rows.map((g) => ({
-    ...g,
-    trashed: trashed.has(g.id),
-    favorite: favorite.has(g.id),
-    tags: tagsByGame[g.id] ?? [],
-    // §7.3's membership is many-to-many, same as tags — a game can carry
-    // several Collections at once, so this is an array, not a single id.
-    collections: collectionsByGame[g.id] ?? [],
-    // subscription_games (§8) records which subscription a game arrived
-    // through, in this same database — read path not added yet.
-    subscription: null
-    // games.created_at (§1) may legitimately be NULL — "a database populated
-    // outside the application's import process... may have no created_at" —
-    // `recentlyAdded()` (below) already treats a falsy `createdAt` as
-    // ineligible, so nothing extra is derived here for it.
-  })));
-
+  if (switched || listConnection !== connection) searchReady = false;
+  mode = 'sql';
+  listConnection = connection;
+  loadedLibraryId = libraryId;
+  games.set(reread);
   tags.set(tagRows);
   collections.set(collectionRows);
+  await refreshList();
+
+  if (!searchReady) completeSearch(connection);
+}
+
+/**
+ * Backfill `game_search` for a database that lacks some of it — one built by
+ * another application, or before the table existed — in the background.
+ * Once complete, search switches from the raw columns to it, and a search
+ * already showing is re-run so it gains its diacritic-insensitive matches.
+ */
+async function completeSearch(connection) {
+  try {
+    await ensureGameSearch(connection);
+  } catch (err) {
+    console.error('Plyvio: failed to build the search index', err);
+    return;
+  }
+  if (listConnection !== connection) return;
+  searchReady = true;
+  if (get(search).trim()) refreshList({ recount: false });
 }
 
 /** { kind: 'all'|'favorites'|'recent'|'trash'|'subscription'|'collection'|'tag', id?: number } */
@@ -288,7 +501,7 @@ export function applySelection(all, sel) {
  * and other metadata. Case- and diacritic-insensitive, so "polgar" finds
  * "Polgár"; a database of chess names is unusable otherwise.
  */
-const fold = (s) => s.normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+// `fold` lives in $lib/library/fold.js — `game_search` (data/games.js) must fold identically.
 
 export function applySearch(list, term) {
   const q = fold(term.trim());
@@ -308,22 +521,46 @@ export const visibleGames = derived(
   ([$games, $sel, $q]) => applySearch(applySelection($games, $sel), $q)
 );
 
-/** Counts for the Sidebar trailing slots. */
-export const counts = derived([games, subscriptions], ([$games, $subs]) => {
-  const live = $games.filter((g) => !g.trashed);
+/** The Sidebar counts, computed over an in-memory list ('memory' mode). */
+export function memoryCounts(all) {
+  const live = all.filter((g) => !g.trashed);
   const byCollection = {}, byTag = {};
   for (const g of live) {
-    for (const c of g.collections) byCollection[c] = (byCollection[c] || 0) + 1;
-    for (const t of g.tags) byTag[t] = (byTag[t] || 0) + 1;
+    for (const c of g.collections ?? []) byCollection[c] = (byCollection[c] || 0) + 1;
+    for (const t of g.tags ?? []) byTag[t] = (byTag[t] || 0) + 1;
   }
   return {
     all: live.length,
     favorites: live.filter((g) => g.favorite).length,
-    recent: recentlyAdded($games).length,
-    trash: $games.filter((g) => g.trashed).length,
+    recent: recentlyAdded(all).length,
+    trash: all.filter((g) => g.trashed).length,
     collection: byCollection,
     tag: byTag
   };
+}
+
+/*
+ * Keep the list current. In 'memory' mode everything is derived from `games`
+ * synchronously, so a test's `games.set(...)` is visible through `counts`,
+ * `visibleTotal` and `rowAt()` at once. In 'sql' mode a changed selection or
+ * search re-asks the database; a change to the `games` cache (a page landing,
+ * an optimistic edit) does not, since it moves no row between lists.
+ */
+visibleGames.subscribe((v) => {
+  visibleNow = v;
+  if (mode !== 'memory') return;
+  visibleTotal.set(v.length);
+  listTick.update((n) => n + 1);
+});
+games.subscribe((all) => {
+  if (mode === 'memory') counts.set(memoryCounts(all));
+});
+let lastQuery = null;
+derived([selection, search], (q) => q).subscribe(([sel, q]) => {
+  const key = JSON.stringify([sel, q]);
+  if (key === lastQuery) return;
+  lastQuery = key;
+  if (mode === 'sql') refreshList({ recount: false });
 });
 
 /* ---------------- selection and navigation --------------------------- */
@@ -348,8 +585,9 @@ export function selectSidebar(sel) {
 export function selectGame(id) { selectedGameId.set(id); }
 export function clearSearch() { search.set(''); }
 
+/** A row by id — any row in the `games` cache, in either mode. */
 export function findGame(id) {
-  return get(games).find((g) => g.id === id) || null;
+  return rowsById.get(id) ?? null;
 }
 
 /** Label of the active Sidebar selection, for the scoped search placeholder. */

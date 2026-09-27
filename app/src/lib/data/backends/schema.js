@@ -84,6 +84,15 @@ CREATE TABLE positions (
     PRIMARY KEY (pos, move)
 ) WITHOUT ROWID;
 
+-- Derived search text (database-schema.md §6a) -- white, black, event, date
+-- and result, case- and diacritic-folded by library/fold.js's searchText().
+-- Reconstructible from games; data/games.js's ensureGameSearch() creates and
+-- backfills it for a database that lacks it, and insertGames() keeps it current.
+CREATE TABLE game_search (
+    game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+    text    TEXT NOT NULL
+);
+
 -- A row means the game is a favorite.
 CREATE TABLE favorites (
     game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE

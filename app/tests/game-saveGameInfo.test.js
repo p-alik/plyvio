@@ -53,6 +53,7 @@ describe('saveGameInfo — real write round trip', () => {
 
     const gameId = sampleGames.GAMES[0].id;
     game.ensureGameState('t1', gameId);
+    await library.ensureGameRow(gameId);
     tabs.activeId.set('t1');
 
     game.saveGameInfo('t1', {
@@ -95,6 +96,7 @@ describe('saveGameInfo — real write round trip', () => {
     await setUpRealLibrary(mods);
     const gameId = sampleGames.GAMES[1].id;
     game.ensureGameState('t1', gameId);
+    await library.ensureGameRow(gameId);
     tabs.activeId.set('t1');
 
     const base = {
@@ -131,6 +133,7 @@ describe('toggleFavourite — real write round trip', () => {
     const id = await setUpRealLibrary(mods);
     const gameId = sampleGames.GAMES[2].id;
     game.ensureGameState('t1', gameId);
+    await library.ensureGameRow(gameId);
     tabs.activeId.set('t1');
 
     game.toggleFavourite('t1');

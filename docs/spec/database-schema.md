@@ -659,6 +659,30 @@ The position key identifies a position for lookup. It is the **first four fields
 
 ---
 
+### 6a. The `game_search` table
+
+A game database **may** carry a `game_search` table: one row per game, holding the text the Library's search matches against (§3.2.4.1 of the product specification), already folded so that it can be matched without reading and folding every game at query time.
+
+**The table is derived data**, in the same sense as `positions` (§6). Every row is reconstructible from `games`, it is never a source of truth, and a game database without one is valid. The application creates and fills it itself when it opens a game database that lacks it, or lacks rows for some games. Doing so writes only to `game_search`, and never to `games`, so opening a Library still neither imports nor modifies its games (§5.1).
+
+| #   | Column    | Type    | Description                                                   |
+| --- | --------- | ------- | ------------------------------------------------------------- |
+| 1   | `game_id` | INTEGER | The game (§1); the row is removed with it                      |
+| 2   | `text`    | TEXT    | `white`, `black`, `event`, `date`, `result`, folded and joined  |
+
+```sql
+CREATE TABLE game_search (
+    game_id INTEGER PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+    text    TEXT NOT NULL
+);
+```
+
+**Folding** is Unicode NFD decomposition, removal of combining marks (U+0300–U+036F), then lower-casing, so `Polgár` is stored as `polgar`. The five fields are joined by U+001F (unit separator), which no field contains, so a search term never matches across two fields. A NULL field folds to the empty string.
+
+**Folding happens in the application, not in SQL.** SQLite's `LIKE` folds ASCII case only, and not every host the application runs on can register a custom SQL function. The same folding is applied to the search term, and the term is matched with `LIKE` against `text`.
+
+---
+
 ## 7. Library features
 
 A game database carries tables for per-Library organization: Favorites, Trash, Tags, and Collections. Each refers to a game by `games.id` (§1) and its row is removed when that game is removed. None of them adds a column to `games` — favoriting, trashing, tagging, and collecting a game are additive relations, not properties of the game row.

@@ -13,7 +13,7 @@ import { analyse, hasLegalMoves } from '$lib/game/engineMock.js';
 import { objects } from './settings.js';
 import {
   games as libraryGames, tags as libraryTags, collections as libraryCollections,
-  activeLibraryConnection, loadGames
+  activeLibraryConnection, loadGames, refreshList, ensureGameRow
 } from './library.js';
 import { known, ratingText, resultText, infoContentHeight } from '$lib/game/info.js';
 import {
@@ -288,7 +288,12 @@ export function ensureGameState(tabId, libraryGameId = null) {
   const existing = get(gameStates)[tabId];
   if (existing) return existing;
   const realGame = isRealGameId(libraryGameId);
-  if (realGame) loadRealGame(libraryGameId);
+  if (realGame) {
+    loadRealGame(libraryGameId);
+    // The Library list is paged, so this game's row — where its favourite,
+    // tags and collections live — may not be cached. The Info card reads it.
+    ensureGameRow(libraryGameId);
+  }
   const game = gameForLibraryId(libraryGameId);
   const state = {
     gameId: game.id,
@@ -581,6 +586,10 @@ function persistFavourite(gameId, on) {
       if (!connection) throw new Error('no database connection');
       await setFavorite(connection, gameId, !!on);
       requestPersistentStorage();
+      // The row itself is already right; the Favorites count, and the
+      // Favorites list if that is what the Library shows, are the database's
+      // answer and must be asked again.
+      refreshList();
     } catch (err) {
       console.error(`Plyvio: failed to save favourite for game ${gameId}`, err);
     }
